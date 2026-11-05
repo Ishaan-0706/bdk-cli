@@ -490,3 +490,84 @@ mod multipath_tests {
             .failure();
     }
 }
+
+// sign is an offline command — no network feature required.
+#[cfg(all(
+    feature = "sqlite",
+    not(any(
+        feature = "electrum",
+        feature = "esplora",
+        feature = "rpc",
+        feature = "cbf"
+    ))
+))]
+mod sign_tests {
+    use crate::common::BdkCli;
+    use predicates::prelude::*;
+    use serde_json::Value;
+    use tempfile::TempDir;
+
+    const WALLET_NAME: &str = "sign_test_wallet";
+    const RECIPIENT: &str = "tb1p4tp4l6glyr2gs94neqcpr5gha7344nfyznfkc8szkreflscsdkgqsdent4:10000";
+
+    fn setup() -> (BdkCli, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let cli = BdkCli::new("regtest", Some(tmp.path().to_path_buf()));
+
+        let desc = cli.cmd("descriptor", &["--type", "tr"]).output().unwrap();
+        let v: Value = serde_json::from_slice(&desc.stdout).unwrap();
+        let ext = v["private_descriptors"]["external"].as_str().unwrap();
+        let int = v["private_descriptors"]["internal"].as_str().unwrap();
+
+        cli.build_base_cmd()
+            .args(["wallet", "--wallet", WALLET_NAME, "config"])
+            .args(["--ext-descriptor", ext, "--int-descriptor", int])
+            .args(["--database-type", "sqlite"])
+            .assert()
+            .success();
+
+        (cli, tmp)
+    }
+
+    #[test]
+    #[ignore = "requires a funded wallet with a small balance — run manually or in funded CI"]
+    fn test_sign_valid_psbt_with_flag_combinations() {
+        let (cli, _tmp) = setup();
+
+        let psbt_output = cli
+            .wallet_cmd(&["--wallet", WALLET_NAME, "create_tx", "--to", RECIPIENT])
+            .output()
+            .expect("create_tx failed to run");
+        assert!(
+            psbt_output.status.success(),
+            "create_tx failed: {}",
+            String::from_utf8_lossy(&psbt_output.stderr)
+        );
+
+        let psbt_json: Value =
+            serde_json::from_slice(&psbt_output.stdout).expect("invalid JSON");
+        let psbt = psbt_json["psbt"].as_str().expect("missing psbt field");
+
+        let flag_sets: &[&[&str]] = &[
+            &["--trust_witness_utxo", "true"],
+            &["--allow_all_sighashes", "true"],
+            &["--try_finalize", "true"],
+            &["--sign_with_tap_internal_key", "true"],
+            &["--allow_grinding", "false"],
+            &["--remove_partial_sigs", "true"],
+            &["--tap_leaves_options", "all"],
+            &["--tap_leaves_options", "none"],
+        ];
+
+        for extra in flag_sets {
+            let mut args = vec!["--wallet", WALLET_NAME, "sign"];
+            args.extend_from_slice(extra);
+            args.push(psbt);
+
+            cli.wallet_cmd(&args)
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("\"psbt\":"));
+        }
+    }
+}
